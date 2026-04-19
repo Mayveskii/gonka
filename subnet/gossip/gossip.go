@@ -22,6 +22,18 @@ type nonceRecord struct {
 	rebroadcast bool // true after first rebroadcast
 }
 
+// nonceDecision holds the result of checking a nonce under the Gossip mutex.
+// This separates lock-protected state reads from I/O operations,
+// ensuring the mutex is always released via defer (single unlock point).
+type nonceDecision struct {
+	equivocation  bool
+	existingHash  []byte
+	existingSlot  uint32
+	accumulate    bool
+	isNewNonce    bool
+	peers         []PeerClient
+}
+
 // Gossip propagates nonce notifications and detects equivocation.
 type Gossip struct {
 	mu       sync.Mutex
@@ -118,30 +130,27 @@ func (g *Gossip) AfterRequest(ctx context.Context, nonce uint64, stateHash, stat
 	g.sendNonceToPeers(ctx, peers, nonce, stateHash, stateSig, g.slotID)
 }
 
-// OnNonceReceived handles incoming nonce notifications from peers.
-// Returns an error if equivocation is detected (same nonce, different hash).
-func (g *Gossip) OnNonceReceived(nonce uint64, stateHash, stateSig []byte, senderSlot uint32) error {
+// checkNonce reads gossip state under the mutex and returns a decision
+// describing what action the caller should take. The mutex is guaranteed
+// to be released when this method returns (defer pattern, single unlock point).
+func (g *Gossip) checkNonce(nonce uint64, stateHash, stateSig []byte, senderSlot uint32) nonceDecision {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	existing, ok := g.seen[nonce]
 	if ok {
 		if !bytes.Equal(existing.stateHash, stateHash) {
-			g.mu.Unlock()
-			g.checkStateConflict(nonce, existing.stateHash, stateHash, existing.slotID, senderSlot)
-			return fmt.Errorf("equivocation at nonce %d: hash %x vs %x (slots %d vs %d)",
-				nonce, existing.stateHash, stateHash, existing.slotID, senderSlot)
-		}
-		// Already seen with same hash. Try to accumulate signature.
-		if g.sigAccumulator != nil {
-			acc := g.sigAccumulator
-			g.mu.Unlock()
-			if err := acc.AccumulateGossipSig(nonce, stateHash, stateSig, senderSlot); err != nil {
-				logging.Debug("accumulate gossip sig failed", "subsystem", "gossip", "nonce", nonce, "error", err)
+			h := make([]byte, len(existing.stateHash))
+			copy(h, existing.stateHash)
+			return nonceDecision{
+				equivocation:  true,
+				existingHash:  h,
+				existingSlot:  existing.slotID,
 			}
-			return nil
 		}
-		g.mu.Unlock()
-		return nil
+		return nonceDecision{
+			accumulate: g.sigAccumulator != nil,
+		}
 	}
 
 	g.seen[nonce] = &nonceRecord{
@@ -153,12 +162,33 @@ func (g *Gossip) OnNonceReceived(nonce uint64, stateHash, stateSig []byte, sende
 	if nonce > g.highestSeen {
 		g.highestSeen = nonce
 	}
-	peers := g.pickPeers()
-	g.mu.Unlock()
+	return nonceDecision{
+		isNewNonce: true,
+		peers:      g.pickPeers(),
+	}
+}
 
-	// Amplification: forward new nonce to K random peers.
-	go g.sendNonceToPeers(context.Background(), peers, nonce, stateHash, stateSig, senderSlot)
+// OnNonceReceived handles incoming nonce notifications from peers.
+// Returns an error if equivocation is detected (same nonce, different hash).
+// All I/O (checkStateConflict, AccumulateGossipSig, sendNonceToPeers) happens
+// outside the mutex after checkNonce releases it.
+func (g *Gossip) OnNonceReceived(nonce uint64, stateHash, stateSig []byte, senderSlot uint32) error {
+	d := g.checkNonce(nonce, stateHash, stateSig, senderSlot)
 
+	if d.equivocation {
+		g.checkStateConflict(nonce, d.existingHash, stateHash, d.existingSlot, senderSlot)
+		return fmt.Errorf("equivocation at nonce %d: hash %x vs %x (slots %d vs %d)",
+			nonce, d.existingHash, stateHash, d.existingSlot, senderSlot)
+	}
+	if d.accumulate {
+		if err := g.sigAccumulator.AccumulateGossipSig(nonce, stateHash, stateSig, senderSlot); err != nil {
+			logging.Debug("accumulate gossip sig failed", "subsystem", "gossip", "nonce", nonce, "error", err)
+		}
+		return nil
+	}
+	if d.isNewNonce {
+		go g.sendNonceToPeers(context.Background(), d.peers, nonce, stateHash, stateSig, senderSlot)
+	}
 	return nil
 }
 
